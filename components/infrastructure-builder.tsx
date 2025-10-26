@@ -7,7 +7,7 @@ import { ComponentPalette } from "@/components/panels/component-palette";
 import { Canvas } from "@/components/canvas/canvas";
 import { PropertiesPanel } from "@/components/panels/properties-panel";
 import { ProvidersPane } from "@/components/panels/providers-pane";
-import { Toolbar } from "@/components/toolbar";
+import { Toolbar } from "@/components/layout/toolbar";
 import { ProjectTitleBar } from "@/components/layout/project-title-bar";
 import { CreateNewProjectDialog } from "@/components/dialogs/create-new-project-dialog";
 import { OpenProjectDialog, type Project } from "@/components/dialogs/open-project-dialog";
@@ -19,8 +19,22 @@ import { ConsoleOutputDialog } from "@/components/dialogs/console-output-dialog"
 import { Button } from "@/components/ui/button";
 import { useToast } from "@/hooks/use-toast";
 import { CredentialManager } from "@/lib/credential-manager";
+import { deployInfrastructure } from "@/lib/api-service";
 import type { Block, Connection } from "@/types/infrastructure";
-import { TerraformGenerator } from "@/components/utils/terraform-generator";
+
+// Helper function to determine provider from block type
+function getProviderFromBlockType(blockType: string): string {
+  const supabaseTypes = ['supabase_database', 'supabase_auth'];
+  const stripeTypes = ['stripe_payment'];
+  
+  if (supabaseTypes.includes(blockType)) {
+    return 'supabase';
+  } else if (stripeTypes.includes(blockType)) {
+    return 'stripe';
+  } else {
+    return 'aws'; // Default to AWS for most cloud services
+  }
+}
 
 interface HistoryState {
   blocks: Block[];
@@ -54,6 +68,9 @@ export function InfrastructureBuilder({ projectId: initialProjectId, onBackToHom
   const [isAIReviewLoading, setIsAIReviewLoading] = useState(false);
   const [aiReviewError, setAiReviewError] = useState<string | null>(null);
   const [deploymentError, setDeploymentError] = useState<string | null>(null);
+  const [deploymentStage, setDeploymentStage] = useState<'none' | 'generated' | 'planned' | 'applying' | 'applied'>('none');
+  const [isGeneratingTerraform, setIsGeneratingTerraform] = useState(false);
+  const [isDeploying, setIsDeploying] = useState(false);
 
   // ASI:One Chat state
   const [chatMessages, setChatMessages] = useState<Array<{role: 'user' | 'assistant', content: string}>>([
@@ -67,9 +84,7 @@ export function InfrastructureBuilder({ projectId: initialProjectId, onBackToHom
 
   // Terraform Generation State
   const [terraformCode, setTerraformCode] = useState<string | null>(null);
-  const [deploymentStage, setDeploymentStage] = useState<'none' | 'generated' | 'planned' | 'applying' | 'applied'>('none');
   const [planOutput, setPlanOutput] = useState<string | null>(null);
-  const [isGeneratingTerraform, setIsGeneratingTerraform] = useState(false);
   const [showTerraformCode, setShowTerraformCode] = useState(false);
   const [showPlanPreview, setShowPlanPreview] = useState(false);
 
@@ -347,7 +362,7 @@ export function InfrastructureBuilder({ projectId: initialProjectId, onBackToHom
 
     // Get credentials for the current provider
     const provider = currentProject?.provider || 'aws';
-    const credentials = CredentialManager.getCredentials(provider);
+    const credentials = CredentialManager.getCredentials(provider as keyof typeof CredentialManager.prototype);
 
     if (!credentials) {
       setDeploymentError(
@@ -449,7 +464,7 @@ export function InfrastructureBuilder({ projectId: initialProjectId, onBackToHom
 
     // Get credentials for the current provider
     const provider = currentProject?.provider || 'aws';
-    const credentials = CredentialManager.getCredentials(provider);
+    const credentials = CredentialManager.getCredentials(provider as keyof typeof CredentialManager.prototype);
 
     if (!credentials) {
       setDeploymentError(
@@ -726,86 +741,57 @@ export function InfrastructureBuilder({ projectId: initialProjectId, onBackToHom
       }));
       console.log('✅ [handleCodeReview] Created mock edges:', mockEdges.length);
 
-      console.log('🔧 [handleCodeReview] Creating Terraform generator...');
-      const generator = new TerraformGenerator(
-        currentProject?.provider || "aws",
-        mockNodes,
-        mockEdges
-      );
+      console.log('🔧 [handleCodeReview] Calling Terraform Generate API...');
+      
+      // Convert blocks to the format expected by the API
+      const apiBlocks = blocks.map(block => ({
+        id: block.id,
+        name: block.name,
+        service: block.type,
+        provider: currentProject?.provider || "aws",
+        config: block.config || {}
+      }));
 
-      console.log('📝 [handleCodeReview] Generating Terraform code...');
-      const terraformCode = generator.generateTerraformCode();
-      console.log('✅ [handleCodeReview] Generated main.tf:', terraformCode?.length || 0, 'characters');
+      const apiConnections = connections.map(conn => ({
+        source: conn.from,
+        target: conn.to
+      }));
+
+      // Call the API route for Terraform generation
+      const response = await fetch('/api/terraform/generate', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          blocks: apiBlocks,
+          connections: apiConnections,
+          provider: currentProject?.provider || "aws"
+        })
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(errorData.error || 'Failed to generate Terraform code');
+      }
+
+      const result = await response.json();
+      const terraformCode = result.terraformCode;
+      
+      console.log('✅ [handleCodeReview] Generated main.tf via API:', terraformCode?.length || 0, 'characters');
       
       // Generate all Terraform files (matching infrastructure-canvas.tsx)
-      const output = generator.generate();
+      // Note: API returns complete Terraform code, no need for separate file generation
       
-      // Generate variables.tf
-      let variablesTf = "# Variables for your infrastructure\n";
-      if (Object.keys(output.variables).length > 0) {
-        Object.entries(output.variables).forEach(([name, config]) => {
-          variablesTf += `variable "${name}" {\n`;
-          Object.entries(config as Record<string, any>).forEach(([key, value]) => {
-            if (typeof value === "string") {
-              variablesTf += `  ${key} = "${value}"\n`;
-            } else {
-              variablesTf += `  ${key} = ${JSON.stringify(value)}\n`;
-            }
-          });
-          variablesTf += "}\n\n";
-        });
-      } else {
-        variablesTf += `variable "region" {
-  description = "Cloud region"
-  type        = string
-  default     = "us-east-1"
-}
-
-variable "environment" {
-  description = "Environment name"
-  type        = string
-  default     = "dev"
-}
-`;
-      }
-      
-      // Generate outputs.tf
-      let outputsTf = "# Outputs for your infrastructure\n";
-      if (Object.keys(output.outputs).length > 0) {
-        Object.entries(output.outputs).forEach(([name, config]) => {
-          outputsTf += `output "${name}" {\n`;
-          Object.entries(config as Record<string, any>).forEach(([key, value]) => {
-            if (typeof value === "string") {
-              outputsTf += `  ${key} = "${value}"\n`;
-            } else {
-              outputsTf += `  ${key} = ${JSON.stringify(value)}\n`;
-            }
-          });
-          outputsTf += "}\n\n";
-        });
-      } else {
-        outputsTf += `output "resources_created" {
-  description = "Number of resources created"
-  value       = ${mockNodes.length}
-}
-`;
-      }
-      
-      // Generate providers.tf
-      const providersTf = generator.generateProviderBlock();
-      
-      // Create files object for API (all 4 files)
+      // Create files object for API (using the generated Terraform code)
       const terraformFiles = {
-        "main.tf": terraformCode,
-        "variables.tf": variablesTf,
-        "outputs.tf": outputsTf,
-        "providers.tf": providersTf
+        "main.tf": terraformCode
       };
       console.log('📦 [handleCodeReview] Prepared files:', Object.keys(terraformFiles));
       
       // Call the AI review API
       console.log('🌐 [handleCodeReview] Calling /api/ai-review...');
-      const response = await fetch('/api/ai-review', {
+      const aiReviewResponse = await fetch('/api/ai-review', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -816,16 +802,16 @@ variable "environment" {
         }),
       });
 
-      console.log('📥 [handleCodeReview] Response status:', response.status);
+      console.log('📥 [handleCodeReview] Response status:', aiReviewResponse.status);
       
-      if (!response.ok) {
-        const errorText = await response.text();
+      if (!aiReviewResponse.ok) {
+        const errorText = await aiReviewResponse.text();
         console.error('❌ [handleCodeReview] API error response:', errorText);
-        throw new Error(`AI review request failed: ${response.status} - ${errorText}`);
+        throw new Error(`AI review request failed: ${aiReviewResponse.status} - ${errorText}`);
       }
 
       console.log('🔍 [handleCodeReview] Parsing response...');
-      const analysis = await response.json();
+      const analysis = await aiReviewResponse.json();
       console.log('✅ [handleCodeReview] Analysis received:', {
         hasAnalysis: !!analysis,
         score: analysis?.overallScore,
@@ -873,7 +859,7 @@ variable "environment" {
             onPlanOrApply={handlePlanOrApply}
             onUndo={handleUndo}
             onRedo={handleRedo}
-            onCodeReview={handleCodeReview}
+            onAIReview={handleCodeReview}
             onViewCode={() => setShowTerraformCode(true)}
             onViewPreview={() => setShowPlanPreview(true)}
             canUndo={historyIndex > 0}
